@@ -1,0 +1,7 @@
+{
+  "name": "value-bet-scanner",
+  "private": true,
+  "scripts": {
+    "build": "node build.js"
+  }
+}
