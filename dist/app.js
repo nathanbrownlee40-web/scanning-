@@ -298,14 +298,13 @@ async function scan() {
   cache = new Map([...cache].filter(([k]) => k.startsWith('leagues:')));
   $('results').innerHTML = '';
   lastBets = [];
-  nearMisses = [];
   diagnostics = { fixtures: 0, oddsFixtures: 0, oddsRows: 0, modelable: 0, rejectedProb: 0, rejectedEV: 0, noHistory: 0, noOdds: 0 };
   $('fixtureCount').textContent = '0';
   $('betCount').textContent = '0';
   $('avgEV').textContent = '0%';
 
   const date = $('date').value;
-  const max = Math.min(300, Math.max(1, Number($('maxFixtures').value) || 50));
+  const max = Math.min(100, Math.max(1, Number($('maxFixtures').value) || 20));
   const hist = Math.min(20, Math.max(5, Number($('history').value) || 10));
   const minProb = Number($('minProb').value) || 0;
   const minEV = Number($('minEV').value);
@@ -328,7 +327,8 @@ async function scan() {
     diagnostics.fixtures = fixtures.length;
     if (!fixtures.length) {
       setStatus('No upcoming fixtures');
-      return setProgress('No fixtures found for this date and league filter.');
+      renderDiagnostics();
+      return setProgress('No upcoming fixtures were returned by API-Football for this date/filter.');
     }
 
     const allBets = [];
@@ -348,54 +348,77 @@ async function scan() {
         const [homeHistory, awayHistory, oddsData] = await Promise.all([
           getHistory(home, season, leagueId, hist),
           getHistory(away, season, leagueId, hist),
-          getOdds(f.fixture.id)
+          getOdds(f.fixture.id).catch(() => ({ response: [] }))
         ]);
 
         const extracted = extractOdds(oddsData, wanted);
         diagnostics.oddsRows += extracted.length;
         const odds = consolidateOdds(extracted);
-        if (!odds.length) { diagnostics.noOdds++; continue; }
-        diagnostics.oddsFixtures++;
+        if (odds.length) diagnostics.oddsFixtures++;
+        else diagnostics.noOdds++;
 
-        for (const o of odds) {
+        const oddsMap = new Map(odds.map(o => [`${o.market}|${o.side}|${o.line}`, o]));
+        const lines = standardLines(wanted, odds);
+        let fixtureModelled = 0;
+
+        for (const spec of lines) {
+          const o = oddsMap.get(`${spec.market}|${spec.side}|${spec.line}`) || null;
           let venueValues = [];
           let overallValues = [];
 
-          if (o.market === 'btts') {
+          if (spec.market === 'btts') {
             venueValues = homeHistory.filter(x => venueForFixture(x, home) === 'home').map(btts)
               .concat(awayHistory.filter(x => venueForFixture(x, away) === 'away').map(btts));
             overallValues = homeHistory.map(btts).concat(awayHistory.map(btts));
           } else {
-            const homeVenue = homeHistory.filter(x => venueForFixture(x, home) === 'home').map(x => metric(x, o.market));
-            const awayVenue = awayHistory.filter(x => venueForFixture(x, away) === 'away').map(x => metric(x, o.market));
-            const homeOverallVals = homeHistory.map(x => metric(x, o.market));
-            const awayOverallVals = awayHistory.map(x => metric(x, o.market));
-            venueValues = homeVenue.concat(awayVenue);
-            overallValues = homeOverallVals.concat(awayOverallVals);
+            venueValues = homeHistory.filter(x => venueForFixture(x, home) === 'home').map(x => metric(x, spec.market))
+              .concat(awayHistory.filter(x => venueForFixture(x, away) === 'away').map(x => metric(x, spec.market)));
+            overallValues = homeHistory.map(x => metric(x, spec.market))
+              .concat(awayHistory.map(x => metric(x, spec.market)));
           }
 
-          const side = o.market === 'btts' ? (o.side === 'yes' ? 'over' : 'under') : o.side;
           const sampleCount = venueValues.filter(v => v != null).length;
-          if (sampleCount < 5) { diagnostics.noHistory++; continue; }
+          if (sampleCount < 5) {
+            diagnostics.noHistory++;
+            continue;
+          }
 
-          const p = modelProbability(venueValues, overallValues, o.line, side, o.market);
-          const e = ev(p, o.bestOdds);
-          if (p == null || e == null) continue;
+          const side = spec.market === 'btts' ? (spec.side === 'yes' ? 'over' : 'under') : spec.side;
+          const p = modelProbability(venueValues, overallValues, spec.line, side, spec.market);
+          if (p == null) continue;
+
+          const currentOdds = o?.bestOdds ?? null;
+          const e = currentOdds ? ev(p, currentOdds) : null;
+          const fair = fairOdds(p);
+          const target = fair * 1.05;
 
           diagnostics.modelable++;
+          fixtureModelled++;
           allBets.push({
             fixture: f,
-            bet: o,
+            bet: o || {
+              market: spec.market,
+              side: spec.side,
+              line: spec.line,
+              label: spec.label,
+              bestOdds: null,
+              odds: null,
+              book: 'No current price',
+              books: 0,
+              consensus: null
+            },
             prob: p,
             ev: e,
-            fairOdds: fairOdds(p),
+            fairOdds: fair,
+            targetOdds: target,
             sample: sampleCount,
-            venueSample: sampleCount,
-            consensus: o.consensus,
+            consensus: o?.consensus ?? null,
             passesProbability: p >= minProb,
-            passesEV: e >= minEV
+            passesEV: e != null && e >= minEV
           });
         }
+
+        if (!fixtureModelled) diagnostics.noHistory++;
       } catch (err) {
         console.warn(`Failed ${f.teams?.home?.name} vs ${f.teams?.away?.name}`, err);
       }
@@ -404,8 +427,12 @@ async function scan() {
     lastBets = allBets;
     render(allBets);
     renderDiagnostics();
+    const valueCount = allBets.filter(x => x.ev != null && x.ev >= minEV && x.prob >= minProb).length;
+    $('betCount').textContent = valueCount;
+    const priced = allBets.filter(x => x.ev != null);
+    $('avgEV').textContent = priced.length ? (priced.reduce((s,x)=>s+x.ev,0)/priced.length).toFixed(2)+'%' : '—';
     setStatus(stopped ? 'Stopped' : 'Scan complete');
-    setProgress(`${allBets.length} bets passed the filters. ${diagnostics.modelable} market lines were modelable.`);
+    setProgress(`${allBets.length} modelled market options across ${new Set(allBets.map(x => x.fixture.fixture.id)).size} games. ${valueCount} meet your value filters.`);
   } catch (err) {
     setStatus('Scan failed', 'err');
     setProgress(err.message);
@@ -413,6 +440,35 @@ async function scan() {
     scanning = false;
     $('scan').disabled = false;
   }
+}
+
+function standardLines(wanted, odds) {
+  const defaults = {
+    goals: [0.5, 1.5, 2.5, 3.5, 4.5],
+    corners: [6.5, 7.5, 8.5, 9.5, 10.5, 11.5, 12.5],
+    shots: [18.5, 20.5, 22.5, 24.5, 26.5, 28.5, 30.5],
+    sot: [4.5, 5.5, 6.5, 7.5, 8.5, 9.5, 10.5],
+    cards: [2.5, 3.5, 4.5, 5.5, 6.5]
+  };
+  const out = [];
+  for (const market of wanted) {
+    if (market === 'btts') {
+      out.push({market, side:'yes', line:0, label:'BTTS — Yes'});
+      out.push({market, side:'no', line:0, label:'BTTS — No'});
+      continue;
+    }
+    const lines = new Set(defaults[market] || []);
+    for (const o of odds.filter(x => x.market === market)) lines.add(o.line);
+    for (const line of [...lines].sort((a,b)=>a-b)) {
+      out.push({market, side:'over', line, label:`${marketLabel(market)} Over ${line}`});
+      out.push({market, side:'under', line, label:`${marketLabel(market)} Under ${line}`});
+    }
+  }
+  return out;
+}
+
+function marketLabel(market) {
+  return ({goals:'Goals', corners:'Corners', shots:'Total Shots', sot:'Shots on Target', cards:'Cards'})[market] || market;
 }
 
 function esc(value) {
@@ -510,8 +566,8 @@ function render(bets) {
 
     for (const x of list) {
       const edge = x.prob - x.consensus;
-      const valueClass = x.ev >= minEV ? 'good' : '';
-      const probClass = x.prob >= minProb ? 'good' : '';
+      const valueClass = x.passesEV ? 'good' : '';
+      const probClass = x.passesProbability ? 'good' : '';
       html += `<div class="bet ${valueClass}">
         <div>
           <div class="market">${esc(x.bet.label)}</div>
