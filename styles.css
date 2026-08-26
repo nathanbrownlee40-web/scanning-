@@ -88,3 +88,8 @@ select:focus { border-color:var(--accent); }
 .diag-grid span { display:block; color:#999; font-size:.78rem; margin-top:4px; }
 .diag-row { display:flex; justify-content:space-between; gap:16px; padding:9px 0; border-top:1px solid rgba(255,255,255,.08); }
 @media (max-width:800px){.diag-grid{grid-template-columns:repeat(2,minmax(0,1fr));}}
+.recommendation{border:1px solid rgba(255,255,255,.14);border-radius:14px;padding:14px;margin:12px 0;background:rgba(255,255,255,.035)}
+.rec-title{font-size:.78rem;text-transform:uppercase;letter-spacing:.08em;opacity:.8}.rec-title span{float:right;text-transform:none;letter-spacing:0;font-size:.72rem;opacity:.65}
+.rec-main{font-size:1.05rem;font-weight:700;margin:6px 0 12px}.rec-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:8px}.rec-grid div{padding:9px;border-radius:10px;background:rgba(255,255,255,.04)}.rec-grid strong{display:block;font-size:1.05rem}.rec-grid small{display:block;opacity:.65;margin-top:2px}
+.markets-title{font-size:.8rem;text-transform:uppercase;letter-spacing:.08em;opacity:.65;margin:16px 0 7px}.good{font-weight:700}.bet.good{border-left:3px solid currentColor}.model-note{margin-top:14px;padding:12px;border-radius:10px;background:rgba(255,255,255,.035);line-height:1.5}
+@media(max-width:700px){.rec-grid{grid-template-columns:repeat(2,1fr)}}

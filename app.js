@@ -357,8 +357,6 @@ async function scan() {
         if (!odds.length) { diagnostics.noOdds++; continue; }
         diagnostics.oddsFixtures++;
 
-        const bets = [];
-
         for (const o of odds) {
           let venueValues = [];
           let overallValues = [];
@@ -379,31 +377,25 @@ async function scan() {
           const side = o.market === 'btts' ? (o.side === 'yes' ? 'over' : 'under') : o.side;
           const sampleCount = venueValues.filter(v => v != null).length;
           if (sampleCount < 5) { diagnostics.noHistory++; continue; }
+
           const p = modelProbability(venueValues, overallValues, o.line, side, o.market);
           const e = ev(p, o.bestOdds);
           if (p == null || e == null) continue;
-          diagnostics.modelable++;
-          const candidate = {
-            fixture: f, bet: o, prob: p, ev: e, fairOdds: fairOdds(p),
-            sample: sampleCount, venueSample: sampleCount, consensus: o.consensus
-          };
-          if (p < minProb) { diagnostics.rejectedProb++; nearMisses.push(candidate); continue; }
-          if (e < minEV) { diagnostics.rejectedEV++; nearMisses.push(candidate); continue; }
 
-          const fair = fairOdds(p);
-          bets.push({
+          diagnostics.modelable++;
+          allBets.push({
             fixture: f,
             bet: o,
             prob: p,
             ev: e,
-            fairOdds: fair,
-            sample: venueValues.filter(v => v != null).length,
-            venueSample: venueValues.filter(v => v != null).length,
-            consensus: o.consensus
+            fairOdds: fairOdds(p),
+            sample: sampleCount,
+            venueSample: sampleCount,
+            consensus: o.consensus,
+            passesProbability: p >= minProb,
+            passesEV: e >= minEV
           });
         }
-
-        allBets.push(...bets);
       } catch (err) {
         console.warn(`Failed ${f.teams?.home?.name} vs ${f.teams?.away?.name}`, err);
       }
@@ -453,23 +445,33 @@ function exportCsv() {
   URL.revokeObjectURL(url);
 }
 
+function safetyScore(x) {
+  // A ranking aid only: higher model probability + more history is preferred.
+  // It is not a guarantee of safety or profit.
+  const sampleBonus = Math.min(10, x.sample) * 0.5;
+  return x.prob + sampleBonus;
+}
+
+function preferredPick(list) {
+  return [...list].sort((a, b) => safetyScore(b) - safetyScore(a))[0] || null;
+}
+
 function renderDiagnostics() {
   const box = $('diagnostics');
   if (!box) return;
-  const near = [...nearMisses].sort((a,b) => b.ev - a.ev).slice(0, 8);
-  const nearHtml = near.length ? near.map(x => `<div class="diag-row"><span>${esc(x.fixture.teams.home.name)} vs ${esc(x.fixture.teams.away.name)} — ${esc(x.bet.label)}</span><strong>${x.prob.toFixed(1)}% / ${x.ev.toFixed(1)}% EV</strong></div>`).join('') : '<div class="muted">No modelable near-misses were produced.</div>';
   box.innerHTML = `<div class="diag-grid">
     <div><b>${diagnostics.fixtures}</b><span>fixtures</span></div>
-    <div><b>${diagnostics.oddsFixtures}</b><span>fixtures with matching odds</span></div>
-    <div><b>${diagnostics.oddsRows}</b><span>odds lines found</span></div>
-    <div><b>${diagnostics.modelable}</b><span>modelable lines</span></div>
-    <div><b>${diagnostics.rejectedProb}</b><span>failed probability</span></div>
-    <div><b>${diagnostics.rejectedEV}</b><span>failed EV</span></div>
-  </div><h3>Closest candidates</h3>${nearHtml}`;
+    <div><b>${diagnostics.oddsFixtures}</b><span>with supported odds</span></div>
+    <div><b>${diagnostics.oddsRows}</b><span>bookmaker lines</span></div>
+    <div><b>${diagnostics.modelable}</b><span>modelled markets</span></div>
+    <div><b>${diagnostics.noHistory}</b><span>insufficient stats</span></div>
+    <div><b>${diagnostics.noOdds}</b><span>no supported odds</span></div>
+  </div>
+  <div class="model-note"><strong>How to read this:</strong> every modelled market is shown below. The scanner no longer hides a match just because it misses your probability/EV thresholds. Look for the <strong>Safer model pick</strong>, then compare the bookmaker price with the model's <strong>fair odds</strong>. A price above fair odds is where the model sees value; a little extra margin above fair odds gives you more room for model error. Nothing here is guaranteed.</div>`;
 }
 
 function render(bets) {
-  bets.sort((a,b) => b.ev - a.ev);
+  bets.sort((a,b) => safetyScore(b) - safetyScore(a));
   $('betCount').textContent = bets.length;
   $('avgEV').textContent = bets.length ? (bets.reduce((s,x)=>s+x.ev,0)/bets.length).toFixed(2)+'%' : '0%';
 
@@ -482,26 +484,48 @@ function render(bets) {
 
   let html = '';
   for (const list of by.values()) {
+    list.sort((a,b) => safetyScore(b) - safetyScore(a));
     const f = list[0].fixture;
     const time = new Date(f.fixture.date).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'});
+    const pick = preferredPick(list);
+    const pickFair = pick.fairOdds;
+    const targetOdds = pickFair ? pickFair * 1.05 : null;
+    const pickValue = pick.ev > 0;
+
     html += `<article class="card">
       <div class="meta">${esc(time)} • ${esc(f.league?.name || 'Unknown league')}</div>
-      <div class="match">${esc(f.teams.home.name)} <span>vs</span> ${esc(f.teams.away.name)}</div>`;
+      <div class="match">${esc(f.teams.home.name)} <span>vs</span> ${esc(f.teams.away.name)}</div>
+      ${pick ? `<div class="recommendation">
+        <div class="rec-title">Safer model pick <span>not a guarantee</span></div>
+        <div class="rec-main">${esc(pick.bet.label)}</div>
+        <div class="rec-grid">
+          <div><strong>${pick.prob.toFixed(1)}%</strong><small>model probability</small></div>
+          <div><strong>${pickFair.toFixed(2)}</strong><small>fair odds</small></div>
+          <div><strong>${targetOdds.toFixed(2)}</strong><small>price to look for*</small></div>
+          <div><strong>${pick.bet.bestOdds.toFixed(2)}</strong><small>best current price</small></div>
+        </div>
+        <div class="muted">${pickValue ? `Current price is ${pick.ev.toFixed(1)}% model EV.` : `Current price is ${pick.ev.toFixed(1)}% model EV — below the model's fair-value threshold.`} ${pick.bet.books} bookmaker${pick.bet.books === 1 ? '' : 's'} compared.</div>
+      </div>` : ''}
+      <div class="markets-title">Available modelled markets</div>`;
+
     for (const x of list) {
       const edge = x.prob - x.consensus;
-      html += `<div class="bet">
+      const valueClass = x.ev >= minEV ? 'good' : '';
+      const probClass = x.prob >= minProb ? 'good' : '';
+      html += `<div class="bet ${valueClass}">
         <div>
           <div class="market">${esc(x.bet.label)}</div>
-          <div class="muted">Best: ${esc(x.bet.book)} @ ${x.bet.bestOdds.toFixed(2)} • ${x.bet.books} bookmaker${x.bet.books === 1 ? '' : 's'}</div>
-          <div class="muted">Model ${x.prob.toFixed(1)}% • consensus ${x.consensus.toFixed(1)}% • fair ${x.fairOdds.toFixed(2)} • sample ${x.sample}</div>
+          <div class="muted">Best: ${esc(x.bet.book)} @ ${x.bet.bestOdds.toFixed(2)} • ${x.bet.books} book${x.bet.books === 1 ? '' : 's'}</div>
+          <div class="muted">Model <span class="${probClass}">${x.prob.toFixed(1)}%</span> • consensus ${x.consensus.toFixed(1)}% • fair ${x.fairOdds.toFixed(2)} • sample ${x.sample}</div>
         </div>
-        <div class="numbers">+${x.ev.toFixed(1)}% EV<br><span class="edge">${edge >= 0 ? '+' : ''}${edge.toFixed(1)}% model edge</span></div>
+        <div class="numbers">${x.ev >= 0 ? '+' : ''}${x.ev.toFixed(1)}% EV<br><span class="edge">${edge >= 0 ? '+' : ''}${edge.toFixed(1)}% model edge</span></div>
       </div>`;
     }
+
     html += `</article>`;
   }
 
-  $('results').innerHTML = html || `<div class="panel"><strong>No bets passed the filters.</strong><p>Try lowering minimum probability/EV, increasing history, or checking whether the selected competition provides odds and match statistics.</p></div>`;
+  $('results').innerHTML = html || `<div class="panel"><strong>No modelled markets were available.</strong><p>This usually means the selected competition/fixtures did not return enough historical statistics or supported bookmaker markets.</p></div>`;
 }
 
 loadLeagues();
