@@ -1,7 +1,5 @@
 {
-  "name": "value-bet-scanner",
+  "name": "vascali",
   "private": true,
-  "scripts": {
-    "build": "node build.js"
-  }
+  "scripts": {"build": "node build.js"}
 }
