@@ -4,6 +4,9 @@ let stopped = false;
 let scanning = false;
 let lastBets = [];
 let cache = new Map();
+let leagueCache = [];
+let diagnostics = { fixtures: 0, oddsFixtures: 0, oddsRows: 0, modelable: 0, rejectedProb: 0, rejectedEV: 0, noHistory: 0, noOdds: 0 };
+let nearMisses = [];
 
 const $ = id => document.getElementById(id);
 
@@ -11,7 +14,6 @@ const today = new Date();
 $('date').value = new Date(today.getTime() - today.getTimezoneOffset() * 60000)
   .toISOString().slice(0, 10);
 
-const configured = true;
 setStatus('API connection ready — key checked server-side');
 
 $('stop').onclick = () => {
@@ -20,6 +22,7 @@ $('stop').onclick = () => {
 };
 $('scan').onclick = scan;
 $('export').onclick = exportCsv;
+$('loadLeagues').onclick = loadLeagues;
 
 function setStatus(text, cls = '') {
   $('status').textContent = text;
@@ -30,15 +33,9 @@ function setProgress(text) {
   $('progress').textContent = text;
 }
 
-function key() {
-  return configured ? 'server' : '';
-}
-
 async function api(path) {
-  if (!key()) throw new Error('API proxy is unavailable.');
-
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 20000);
+  const timeout = setTimeout(() => controller.abort(), 25000);
   try {
     const r = await fetch(`${API_PROXY}?path=${encodeURIComponent(path)}`, {
       headers: { 'Accept': 'application/json' },
@@ -50,20 +47,20 @@ async function api(path) {
     catch { throw new Error('API returned invalid JSON'); }
 
     if (!r.ok || (d.errors && Object.keys(d.errors).length)) {
-      throw new Error(
-        typeof d.errors === 'object'
-          ? Object.values(d.errors).join(', ')
-          : `HTTP ${r.status}`
-      );
+      const errors = typeof d.errors === 'object' ? Object.values(d.errors) : [`HTTP ${r.status}`];
+      throw new Error(errors.join(', '));
     }
     return d;
   } catch (err) {
     if (err.name === 'AbortError') throw new Error('API request timed out');
-    throw new Error(`Network error: ${err.message}`);
+    throw new Error(err.message || 'Network error');
   } finally {
     clearTimeout(timeout);
   }
 }
+
+function cacheGet(key) { return cache.get(key); }
+function cacheSet(key, value) { cache.set(key, value); return value; }
 
 function chunks(a, n) {
   const out = [];
@@ -76,20 +73,15 @@ function n(v) {
   return Number.isFinite(x) ? x : null;
 }
 
-function statValue(stat, name, side) {
-  const x = stat?.statistics?.find(
-    s => String(s.type).toLowerCase() === name.toLowerCase()
-  );
-  return n(x?.[side]);
-}
-
-function fixtureStats(f) {
-  return f.statistics || [];
+function statValue(fixture, name, side) {
+  const block = (fixture.statistics || []).find(x => String(x.team?.name || '').toLowerCase() === String(side).toLowerCase());
+  const x = block?.statistics?.find(s => String(s.type).toLowerCase() === name.toLowerCase());
+  return n(x?.value);
 }
 
 function totalFromFixture(f, type) {
-  const h = statValue(f, type, 'home');
-  const a = statValue(f, type, 'away');
+  const h = statValue(f, type, f.teams?.home?.name);
+  const a = statValue(f, type, f.teams?.away?.name);
   return h != null && a != null ? h + a : null;
 }
 
@@ -113,18 +105,65 @@ function metric(f, market) {
   return null;
 }
 
-function probability(values, line, side) {
-  const usable = values.filter(v => v != null);
-  if (usable.length < 5) return null;
+function venueForFixture(f, teamId) {
+  if (f.teams?.home?.id === teamId) return 'home';
+  if (f.teams?.away?.id === teamId) return 'away';
+  return null;
+}
 
-  const hits = usable.filter(v => side === 'over' ? v > line : v <= line).length;
+function recencyWeight(index) {
+  return Math.pow(0.92, index);
+}
 
-  // Laplace smoothing avoids displaying 0% or 100% from a small sample.
-  return (hits + 1) / (usable.length + 2) * 100;
+function weightedHitRate(values, line, side) {
+  let hitWeight = 0;
+  let totalWeight = 0;
+  values.forEach((v, index) => {
+    if (v == null) return;
+    const w = recencyWeight(index);
+    totalWeight += w;
+    const hit = side === 'over' ? v > line : v <= line;
+    if (hit) hitWeight += w;
+  });
+  return totalWeight ? { hitWeight, totalWeight } : null;
+}
+
+function modelProbability(venueValues, overallValues, line, side, market) {
+  const venue = weightedHitRate(venueValues, line, side);
+  const overall = weightedHitRate(overallValues, line, side);
+  if (!venue && !overall) return null;
+
+  // Venue-specific form carries most of the signal; overall form stabilises small samples.
+  const venueShare = venue ? 0.72 : 0;
+  const overallShare = overall ? (venue ? 0.28 : 1) : 0;
+  const priorStrength = market === 'btts' ? 5 : 4;
+
+  let hits = priorStrength * 0.5;
+  let exposure = priorStrength;
+
+  if (venue) {
+    hits += venue.hitWeight * venueShare;
+    exposure += venue.totalWeight * venueShare;
+  }
+  if (overall) {
+    hits += overall.hitWeight * overallShare;
+    exposure += overall.totalWeight * overallShare;
+  }
+
+  // Bayesian/Laplace-style shrinkage keeps tiny samples from producing extreme probabilities.
+  return Math.max(1, Math.min(99, hits / exposure * 100));
+}
+
+function fairOdds(prob) {
+  return prob > 0 ? 100 / prob : null;
 }
 
 function ev(prob, odds) {
   return prob != null && odds > 0 ? (prob / 100 * odds - 1) * 100 : null;
+}
+
+function implied(odds) {
+  return odds > 0 ? 100 / odds : null;
 }
 
 function normalize(s) {
@@ -133,149 +172,163 @@ function normalize(s) {
 
 function marketBucket(name) {
   const x = normalize(name);
-
-  if (x.includes('goalsoverunder')) return 'goals';
-  if (x.includes('bothteamsscore')) return 'btts';
-  if (x.includes('cornerkicks') && x.includes('overunder')) return 'corners';
-  if (x.includes('totalshots') && x.includes('overunder')) return 'shots';
-  if ((x.includes('shotsongoal') || x.includes('shotsontarget')) && x.includes('overunder')) return 'sot';
-  if ((x.includes('totalcards') || x.includes('cards')) && x.includes('overunder')) return 'cards';
-
+  // API-Football bookmaker market names vary slightly by bookmaker.
+  if ((x.includes('goals') || x.includes('totalgoals')) && (x.includes('overunder') || x.includes('ou'))) return 'goals';
+  if (x.includes('bothteamsscore') || x.includes('btts')) return 'btts';
+  if (x.includes('corner') && (x.includes('overunder') || x.includes('ou'))) return 'corners';
+  if ((x.includes('totalshots') || x === 'shots') && !x.includes('ongoal') && !x.includes('ontarget') && (x.includes('overunder') || x.includes('ou'))) return 'shots';
+  if ((x.includes('shotsongoal') || x.includes('shotsontarget') || x.includes('shotsontargets')) && (x.includes('overunder') || x.includes('ou'))) return 'sot';
+  if (x.includes('card') && (x.includes('overunder') || x.includes('ou'))) return 'cards';
   return null;
 }
 
 function parseValue(v) {
   const s = String(v?.value ?? v?.name ?? '');
   const m = s.match(/(over|under)\s*([0-9]+(?:\.[0-9]+)?)/i);
-
-  if (m) {
-    return {
-      side: m[1].toLowerCase(),
-      line: parseFloat(m[2]),
-      label: s
-    };
-  }
-
-  if (/^(yes|no)$/i.test(s)) {
-    return {
-      side: s.toLowerCase(),
-      line: 0,
-      label: s
-    };
-  }
-
+  if (m) return { side: m[1].toLowerCase(), line: parseFloat(m[2]), label: s };
+  if (/^(yes|no)$/i.test(s)) return { side: s.toLowerCase(), line: 0, label: s };
   return null;
 }
 
 function extractOdds(data, wanted) {
   const out = [];
-
-  for (const book of (data.response?.[0]?.bookmakers || [])) {
+  const fixtureBlock = data.response?.[0];
+  for (const book of (fixtureBlock?.bookmakers || [])) {
     for (const bet of (book.bets || [])) {
-      const bucket = marketBucket(bet.name);
-      if (!bucket || !wanted.includes(bucket)) continue;
-
+      const market = marketBucket(bet.name);
+      if (!market || !wanted.includes(market)) continue;
       for (const val of (bet.values || [])) {
-        const p = parseValue(val);
+        const parsed = parseValue(val);
         const odds = n(val.odd);
-
-        if (!p || odds == null) continue;
-
+        if (!parsed || odds == null || odds <= 1) continue;
         out.push({
-          market: bucket,
-          side: p.side,
-          line: bucket === 'btts' ? 0 : p.line,
-          label: p.label,
+          market,
+          side: parsed.side,
+          line: market === 'btts' ? 0 : parsed.line,
+          label: parsed.label,
           odds,
           book: book.name
         });
       }
     }
   }
-
   return out;
 }
 
-async function getHistory(teamId, season, last) {
-  const ck = `hist:${teamId}:${season}:${last}`;
-  if (cache.has(ck)) return cache.get(ck);
+function consolidateOdds(rows) {
+  const groups = new Map();
+  for (const row of rows) {
+    const key = `${row.market}|${row.side}|${row.line}`;
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(row);
+  }
+  return [...groups.values()].map(group => {
+    group.sort((a, b) => b.odds - a.odds);
+    const avgImplied = group.reduce((s, x) => s + implied(x.odds), 0) / group.length;
+    return {
+      ...group[0],
+      bestOdds: group[0].odds,
+      book: group[0].book,
+      books: group.length,
+      consensus: 100 - avgImplied,
+      allOdds: group
+    };
+  });
+}
 
-  const d = await api(
-    `/fixtures?team=${teamId}&season=${season}&last=${last}&status=FT-AET-PEN`
-  );
+async function getHistory(teamId, season, league, last) {
+  const ck = `hist:${teamId}:${season}:${league}:${last}`;
+  const cached = cacheGet(ck);
+  if (cached) return cached;
 
-  const ids = (d.response || [])
-    .map(x => x.fixture?.id)
-    .filter(Boolean);
+  const d = await api(`/fixtures?team=${teamId}&season=${season}&league=${league}&last=${last}`);
+  const ids = (d.response || []).filter(x => ['FT', 'AET', 'PEN'].includes(x.fixture?.status?.short))
+    .map(x => x.fixture?.id).filter(Boolean);
 
   const result = [];
-
-  // API-Football supports up to 20 fixture IDs in the ids query and includes
-  // available fixture statistics in the detailed response.
   for (const group of chunks(ids, 20)) {
     const detail = await api(`/fixtures?ids=${group.join('-')}`);
     result.push(...(detail.response || []));
   }
-
-  cache.set(ck, result);
-  return result;
+  result.sort((a, b) => new Date(b.fixture.date) - new Date(a.fixture.date));
+  return cacheSet(ck, result);
 }
 
 async function getOdds(id) {
   const ck = `odds:${id}`;
-  if (cache.has(ck)) return cache.get(ck);
+  const cached = cacheGet(ck);
+  if (cached) return cached;
+  return cacheSet(ck, await api(`/odds?fixture=${id}`));
+}
 
-  const d = await api(`/odds?fixture=${id}`);
-  cache.set(ck, d);
-  return d;
+async function getLeagues() {
+  const ck = 'leagues:current';
+  const cached = cacheGet(ck);
+  if (cached) return cached;
+  const d = await api('/leagues?current=true');
+  return cacheSet(ck, d.response || []);
+}
+
+async function loadLeagues() {
+  const btn = $('loadLeagues');
+  btn.disabled = true;
+  try {
+    setProgress('Loading current leagues…');
+    const rows = await getLeagues();
+    leagueCache = rows;
+    const select = $('league');
+    const previous = select.value;
+    const sorted = rows.sort((a, b) => `${a.country?.name || ''}${a.league?.name || ''}`.localeCompare(`${b.country?.name || ''}${b.league?.name || ''}`));
+    select.innerHTML = '<option value="">All leagues</option>' + sorted.map(x =>
+      `<option value="${escAttr(x.league?.id)}">${esc(x.country?.name || 'Other')} — ${esc(x.league?.name || 'Unknown')}</option>`
+    ).join('');
+    if ([...select.options].some(o => o.value === previous)) select.value = previous;
+    setProgress(`${rows.length} current leagues loaded.`);
+  } catch (err) {
+    setStatus('Could not load leagues', 'err');
+    setProgress(err.message);
+  } finally {
+    btn.disabled = false;
+  }
 }
 
 async function scan() {
+  if (scanning) return;
   stopped = false;
-  cache = new Map();
-
+  cache = new Map([...cache].filter(([k]) => k.startsWith('leagues:')));
   $('results').innerHTML = '';
   lastBets = [];
+  nearMisses = [];
+  diagnostics = { fixtures: 0, oddsFixtures: 0, oddsRows: 0, modelable: 0, rejectedProb: 0, rejectedEV: 0, noHistory: 0, noOdds: 0 };
   $('fixtureCount').textContent = '0';
   $('betCount').textContent = '0';
   $('avgEV').textContent = '0%';
 
-  if (!key()) {
-    setStatus('API key required — configure it in Netlify', 'err');
-    return;
-  }
-
   const date = $('date').value;
-  const max = Number($('maxFixtures').value) || 50;
-  const hist = Number($('history').value) || 10;
+  const max = Math.min(300, Math.max(1, Number($('maxFixtures').value) || 50));
+  const hist = Math.min(20, Math.max(5, Number($('history').value) || 10));
   const minProb = Number($('minProb').value) || 0;
-  const minEV = Number($('minEV').value) || -999;
+  const minEV = Number($('minEV').value);
+  const league = $('league').value;
+  const wanted = [...document.querySelectorAll('.markets input:checked')].map(x => x.value);
 
-  const wanted = [...document.querySelectorAll('.markets input:checked')]
-    .map(x => x.value);
-
-  if (!wanted.length) {
-    setStatus('Select at least one market', 'err');
-    return;
-  }
+  if (!date) return setStatus('Choose a date', 'err');
+  if (!wanted.length) return setStatus('Select at least one market', 'err');
 
   scanning = true;
   $('scan').disabled = true;
   try {
     setStatus('Loading fixtures…');
-
-    const fd = await api(`/fixtures?date=${date}`);
-
+    const fd = await api(`/fixtures?date=${encodeURIComponent(date)}${league ? `&league=${encodeURIComponent(league)}` : ''}`);
     const fixtures = (fd.response || [])
       .filter(f => ['NS', 'TBD'].includes(f.fixture?.status?.short))
       .slice(0, max);
 
     $('fixtureCount').textContent = fixtures.length;
-
+    diagnostics.fixtures = fixtures.length;
     if (!fixtures.length) {
       setStatus('No upcoming fixtures');
-      setProgress('No fixtures found for this date.');
-      return;
+      return setProgress('No fixtures found for this date and league filter.');
     }
 
     const allBets = [];
@@ -283,66 +336,84 @@ async function scan() {
 
     for (const f of fixtures) {
       if (stopped) break;
-
       const season = f.league?.season;
+      const leagueId = f.league?.id;
       const home = f.teams?.home?.id;
       const away = f.teams?.away?.id;
+      if (!season || !leagueId || !home || !away) continue;
 
-      if (!season || !home || !away) continue;
-
-      setProgress(
-        `Analysing ${++done}/${fixtures.length}: ${esc(f.teams.home.name)} vs ${esc(f.teams.away.name)}`
-      );
+      setProgress(`Analysing ${++done}/${fixtures.length}: ${f.teams.home.name} vs ${f.teams.away.name}`);
 
       try {
-        const [hh, ah, od] = await Promise.all([
-          getHistory(home, season, hist),
-          getHistory(away, season, hist),
+        const [homeHistory, awayHistory, oddsData] = await Promise.all([
+          getHistory(home, season, leagueId, hist),
+          getHistory(away, season, leagueId, hist),
           getOdds(f.fixture.id)
         ]);
 
-        const combined = [...hh, ...ah];
-        const unique = [...new Map(
-          combined.map(x => [x.fixture.id, x])
-        ).values()];
+        const extracted = extractOdds(oddsData, wanted);
+        diagnostics.oddsRows += extracted.length;
+        const odds = consolidateOdds(extracted);
+        if (!odds.length) { diagnostics.noOdds++; continue; }
+        diagnostics.oddsFixtures++;
 
-        const odds = extractOdds(od, wanted);
+        const bets = [];
 
         for (const o of odds) {
-          let p;
+          let venueValues = [];
+          let overallValues = [];
 
           if (o.market === 'btts') {
-            const vals = unique.map(btts);
-            const yesProb = probability(vals, 0, 'over');
-            p = yesProb == null ? null : (o.side === 'yes' ? yesProb : 100 - yesProb);
+            venueValues = homeHistory.filter(x => venueForFixture(x, home) === 'home').map(btts)
+              .concat(awayHistory.filter(x => venueForFixture(x, away) === 'away').map(btts));
+            overallValues = homeHistory.map(btts).concat(awayHistory.map(btts));
           } else {
-            const vals = unique.map(x => metric(x, o.market));
-            p = probability(vals, o.line, o.side);
+            const homeVenue = homeHistory.filter(x => venueForFixture(x, home) === 'home').map(x => metric(x, o.market));
+            const awayVenue = awayHistory.filter(x => venueForFixture(x, away) === 'away').map(x => metric(x, o.market));
+            const homeOverallVals = homeHistory.map(x => metric(x, o.market));
+            const awayOverallVals = awayHistory.map(x => metric(x, o.market));
+            venueValues = homeVenue.concat(awayVenue);
+            overallValues = homeOverallVals.concat(awayOverallVals);
           }
 
-          const e = ev(p, o.odds);
+          const side = o.market === 'btts' ? (o.side === 'yes' ? 'over' : 'under') : o.side;
+          const sampleCount = venueValues.filter(v => v != null).length;
+          if (sampleCount < 5) { diagnostics.noHistory++; continue; }
+          const p = modelProbability(venueValues, overallValues, o.line, side, o.market);
+          const e = ev(p, o.bestOdds);
+          if (p == null || e == null) continue;
+          diagnostics.modelable++;
+          const candidate = {
+            fixture: f, bet: o, prob: p, ev: e, fairOdds: fairOdds(p),
+            sample: sampleCount, venueSample: sampleCount, consensus: o.consensus
+          };
+          if (p < minProb) { diagnostics.rejectedProb++; nearMisses.push(candidate); continue; }
+          if (e < minEV) { diagnostics.rejectedEV++; nearMisses.push(candidate); continue; }
 
-          if (p == null || e == null || p < minProb || e < minEV) continue;
-
-          allBets.push({
+          const fair = fairOdds(p);
+          bets.push({
             fixture: f,
             bet: o,
             prob: p,
             ev: e,
-            sample: unique
-              .map(x => metric(x, o.market))
-              .filter(v => v != null).length
+            fairOdds: fair,
+            sample: venueValues.filter(v => v != null).length,
+            venueSample: venueValues.filter(v => v != null).length,
+            consensus: o.consensus
           });
         }
+
+        allBets.push(...bets);
       } catch (err) {
-        console.warn(f.teams?.home?.name, err);
+        console.warn(`Failed ${f.teams?.home?.name} vs ${f.teams?.away?.name}`, err);
       }
     }
 
     lastBets = allBets;
     render(allBets);
+    renderDiagnostics();
     setStatus(stopped ? 'Stopped' : 'Scan complete');
-    setProgress(`${allBets.length} value bets passed your filters.`);
+    setProgress(`${allBets.length} bets passed the filters. ${diagnostics.modelable} market lines were modelable.`);
   } catch (err) {
     setStatus('Scan failed', 'err');
     setProgress(err.message);
@@ -357,48 +428,52 @@ function esc(value) {
     '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#39;', '"': '&quot;'
   })[ch]);
 }
-
+function escAttr(value) { return esc(value); }
 function csvCell(value) {
   const s = String(value ?? '');
   return /[",\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
 }
 
 function exportCsv() {
-  if (!lastBets.length) {
-    setProgress('Run a scan first — there are no results to export.');
-    return;
-  }
-
-  const rows = [['Date', 'Time', 'League', 'Home', 'Away', 'Market', 'Bookmaker', 'Odds', 'Probability %', 'EV %', 'Sample']];
+  if (!lastBets.length) return setProgress('Run a scan first — there are no results to export.');
+  const rows = [['Date','Time','League','Home','Away','Market','Best bookmaker','Odds','Model probability %','Fair odds','EV %','Books','Consensus %','Sample']];
   for (const x of lastBets) {
     const f = x.fixture;
     rows.push([
-      new Date(f.fixture.date).toISOString().slice(0, 10),
-      new Date(f.fixture.date).toLocaleTimeString([], {hour: '2-digit', minute: '2-digit'}),
+      new Date(f.fixture.date).toISOString().slice(0,10),
+      new Date(f.fixture.date).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'}),
       f.league?.name || '', f.teams?.home?.name || '', f.teams?.away?.name || '',
-      x.bet.label, x.bet.book, x.bet.odds.toFixed(2), x.prob.toFixed(1), x.ev.toFixed(1), x.sample
+      x.bet.label, x.bet.book, x.bet.bestOdds.toFixed(2), x.prob.toFixed(1),
+      x.fairOdds?.toFixed(2) || '', x.ev.toFixed(1), x.bet.books, x.consensus.toFixed(1), x.sample
     ]);
   }
-
-  const blob = new Blob([rows.map(r => r.map(csvCell).join(',')).join('\n')], {type: 'text/csv;charset=utf-8'});
+  const blob = new Blob([rows.map(r => r.map(csvCell).join(',')).join('\n')], {type:'text/csv;charset=utf-8'});
   const url = URL.createObjectURL(blob);
-  const a = document.createElement('a');
-  a.href = url;
-  a.download = `value-bets-${$('date').value || 'scan'}.csv`;
-  a.click();
+  const a = document.createElement('a'); a.href = url; a.download = `value-bets-${$('date').value || 'scan'}.csv`; a.click();
   URL.revokeObjectURL(url);
 }
 
-function render(bets) {
-  bets.sort((a, b) => b.ev - a.ev);
+function renderDiagnostics() {
+  const box = $('diagnostics');
+  if (!box) return;
+  const near = [...nearMisses].sort((a,b) => b.ev - a.ev).slice(0, 8);
+  const nearHtml = near.length ? near.map(x => `<div class="diag-row"><span>${esc(x.fixture.teams.home.name)} vs ${esc(x.fixture.teams.away.name)} — ${esc(x.bet.label)}</span><strong>${x.prob.toFixed(1)}% / ${x.ev.toFixed(1)}% EV</strong></div>`).join('') : '<div class="muted">No modelable near-misses were produced.</div>';
+  box.innerHTML = `<div class="diag-grid">
+    <div><b>${diagnostics.fixtures}</b><span>fixtures</span></div>
+    <div><b>${diagnostics.oddsFixtures}</b><span>fixtures with matching odds</span></div>
+    <div><b>${diagnostics.oddsRows}</b><span>odds lines found</span></div>
+    <div><b>${diagnostics.modelable}</b><span>modelable lines</span></div>
+    <div><b>${diagnostics.rejectedProb}</b><span>failed probability</span></div>
+    <div><b>${diagnostics.rejectedEV}</b><span>failed EV</span></div>
+  </div><h3>Closest candidates</h3>${nearHtml}`;
+}
 
+function render(bets) {
+  bets.sort((a,b) => b.ev - a.ev);
   $('betCount').textContent = bets.length;
-  $('avgEV').textContent = bets.length
-    ? (bets.reduce((s, x) => s + x.ev, 0) / bets.length).toFixed(2) + '%'
-    : '0%';
+  $('avgEV').textContent = bets.length ? (bets.reduce((s,x)=>s+x.ev,0)/bets.length).toFixed(2)+'%' : '0%';
 
   const by = new Map();
-
   for (const b of bets) {
     const id = b.fixture.fixture.id;
     if (!by.has(id)) by.set(id, []);
@@ -406,37 +481,27 @@ function render(bets) {
   }
 
   let html = '';
-
   for (const list of by.values()) {
     const f = list[0].fixture;
-    const time = new Date(f.fixture.date).toLocaleTimeString([], {
-      hour: '2-digit',
-      minute: '2-digit'
-    });
-
+    const time = new Date(f.fixture.date).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'});
     html += `<article class="card">
       <div class="meta">${esc(time)} • ${esc(f.league?.name || 'Unknown league')}</div>
-      <div class="match">${esc(f.teams.home.name)} vs ${esc(f.teams.away.name)}</div>`;
-
+      <div class="match">${esc(f.teams.home.name)} <span>vs</span> ${esc(f.teams.away.name)}</div>`;
     for (const x of list) {
+      const edge = x.prob - x.consensus;
       html += `<div class="bet">
         <div>
           <div class="market">${esc(x.bet.label)}</div>
-          <div class="muted">${esc(x.bet.book)} • ${x.sample} historical matches</div>
+          <div class="muted">Best: ${esc(x.bet.book)} @ ${x.bet.bestOdds.toFixed(2)} • ${x.bet.books} bookmaker${x.bet.books === 1 ? '' : 's'}</div>
+          <div class="muted">Model ${x.prob.toFixed(1)}% • consensus ${x.consensus.toFixed(1)}% • fair ${x.fairOdds.toFixed(2)} • sample ${x.sample}</div>
         </div>
-        <div class="numbers">
-          ${x.bet.odds.toFixed(2)} odds<br>
-          ${x.prob.toFixed(1)}% prob • +${x.ev.toFixed(1)}% EV
-        </div>
+        <div class="numbers">+${x.ev.toFixed(1)}% EV<br><span class="edge">${edge >= 0 ? '+' : ''}${edge.toFixed(1)}% model edge</span></div>
       </div>`;
     }
-
     html += `</article>`;
   }
 
-  $('results').innerHTML = html ||
-    `<div class="panel">
-      <strong>No bets passed the filters.</strong>
-      <p>Try lowering minimum probability/EV or check whether the selected league has odds and statistics coverage.</p>
-    </div>`;
+  $('results').innerHTML = html || `<div class="panel"><strong>No bets passed the filters.</strong><p>Try lowering minimum probability/EV, increasing history, or checking whether the selected competition provides odds and match statistics.</p></div>`;
 }
+
+loadLeagues();

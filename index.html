@@ -11,31 +11,34 @@
   <main class="app">
     <header>
       <div>
-        <div class="eyebrow">API-FOOTBALL • STATIC SCANNER</div>
+        <div class="eyebrow">API-FOOTBALL • VALUE SCANNER</div>
         <h1>Value Bet Scanner</h1>
-        <p>Direct browser scanner — API key is managed by Netlify.</p>
+        <p>Pre-match football scanner using bookmaker odds, venue form and historical match statistics.</p>
       </div>
-      <div class="status" id="status">Checking API key…</div>
+      <div class="status" id="status">Connecting…</div>
     </header>
 
     <section class="panel controls">
       <h2>Scanner</h2>
-
       <div class="grid">
         <label>Date<input id="date" type="date"></label>
-        <label>Max fixtures<input id="maxFixtures" type="number" min="1" max="300" value="50"></label>
-        <label>Min probability %<input id="minProb" type="number" min="0" max="100" value="60"></label>
+        <label>League
+          <select id="league"><option value="">All leagues</option></select>
+          <button class="mini" id="loadLeagues" type="button">Refresh leagues</button>
+        </label>
+        <label>Max fixtures<input id="maxFixtures" type="number" min="1" max="300" value="30"></label>
+        <label>Min probability %<input id="minProb" type="number" min="0" max="99" value="60"></label>
         <label>Min EV %<input id="minEV" type="number" min="-100" max="500" value="5"></label>
         <label>History matches<input id="history" type="number" min="5" max="20" value="10"></label>
       </div>
 
       <div class="markets">
-        <label><input type="checkbox" value="goals" checked> Goals</label>
+        <label><input type="checkbox" value="goals" checked> Goals O/U</label>
         <label><input type="checkbox" value="btts" checked> BTTS</label>
-        <label><input type="checkbox" value="corners" checked> Match corners</label>
-        <label><input type="checkbox" value="shots" checked> Match shots</label>
-        <label><input type="checkbox" value="sot" checked> Match shots on target</label>
-        <label><input type="checkbox" value="cards" checked> Match cards</label>
+        <label><input type="checkbox" value="corners" checked> Corners O/U</label>
+        <label><input type="checkbox" value="shots" checked> Shots O/U</label>
+        <label><input type="checkbox" value="sot" checked> Shots on target O/U</label>
+        <label><input type="checkbox" value="cards" checked> Cards O/U</label>
       </div>
 
       <div class="actions">
@@ -43,9 +46,8 @@
         <button class="secondary" id="stop">Stop</button>
         <button class="secondary" id="export">Export CSV</button>
       </div>
-
       <div id="progress" class="progress"></div>
-      <p class="note">Probabilities are historical hit rates with Laplace smoothing, not guaranteed outcomes. EV is calculated from the displayed odds.</p>
+      <p class="note">Model probability blends venue-specific recent form with overall team form and Bayesian shrinkage. EV uses the best available bookmaker price. This is a statistical model, not a guarantee of profit.</p>
     </section>
 
     <section class="panel summary">
@@ -54,9 +56,9 @@
       <div><strong id="avgEV">0%</strong><span>avg EV</span></div>
     </section>
 
+    <section id="diagnostics" class="panel diagnostics"></section>
     <section id="results" class="results"></section>
   </main>
-
   <script src="app.js"></script>
 </body>
 </html>
